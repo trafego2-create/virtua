@@ -1,6 +1,6 @@
 # Virtua — sistema de cobranças
 
-Substitui o Virtua Software. FastAPI + Postgres (Supabase, schema `virtua`) + HTML/JS puro. Deploy no EasyPanel pelo `Dockerfile`.
+Substitui o Virtua Software. FastAPI + Postgres (Supabase, schema `virtua`) + HTML/JS puro. Deploy no EasyPanel puxando deste repositório (`Dockerfile` na raiz).
 
 ## Rodar local
 ```
@@ -28,3 +28,9 @@ Administrador: tudo · Gestor: vê tudo + histórico · Financeiro: edita client
 
 ## Testes
 `tests/test_fluxo.py`, ponta a ponta contra o banco **local** (recarrega a carteira no fim).
+
+## Deploy (EasyPanel novo, projeto `automacoes`, serviço `virtua`)
+- Fonte: GitHub `trafego2-create/virtua`, branch `main`, caminho `/`, build Dockerfile.
+- Environment: `DATABASE_URL` (Supabase comercial, pooler), `PUBLIC_URL`, `SESSION_SECRET`. Valores fora do git.
+- Domínio: `automacoes-virtua.qacfzn.easypanel.host`, porta 8000.
+- `scripts/publicar.py` (pacote no Storage + Dockerfile com link assinado) foi a alternativa de antes de existir o repo. Não precisa mais.
