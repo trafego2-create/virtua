@@ -22,7 +22,7 @@ const quando = v => (v ? new Date(v).toLocaleString("pt-BR") : "");
 const selo = s => `<span class="selo s-${esc(s)}">${esc(ROTULO[s] || s)}</span>`;
 const isoLocal = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 const hoje = () => isoLocal(new Date());  // data local (toISOString é UTC e vira o dia depois das 21h)
-const plural = (n, palavra) => `${Number(n).toLocaleString("pt-BR")} ${palavra}${Number(n) === 1 ? "" : "s"}`;
+const plural = (n, um, varios = um + "s") => `${Number(n).toLocaleString("pt-BR")} ${Number(n) === 1 ? um : varios}`;
 
 async function api(metodo, url, corpo) {
   const r = await fetch(url, {
@@ -127,11 +127,11 @@ function rotear() {
   if (!EU) return;
   const [, rota, arg] = (location.hash || "#/clientes").split("/");
   const itens = [["painel", "Painel"], ["clientes", "Clientes"], ["inadimplencia", "Inadimplência"], ["previsao", "Previsão"], ["relatorios", "Relatórios"]];
-  if (EU.perfil === "administrador") itens.push(["configuracoes", "Configurações"], ["usuarios", "Usuários"]);
+  if (EU.perfil === "administrador") itens.push(["importar", "Importar"], ["configuracoes", "Configurações"], ["usuarios", "Usuários"]);
   if (["administrador", "gestor"].includes(EU.perfil)) itens.push(["historico", "Histórico"]);
   $("#menu").innerHTML = itens.map(([r, t]) => `<a href="#/${r}" class="${(rota === r || (rota === "cliente" && r === "clientes")) ? "ativo" : ""}">${t}</a>`).join("");
   const telas = { clientes: telaClientes, cliente: () => telaFicha(decodeURIComponent(arg || "")),
-    inadimplencia: telaInadimplencia, previsao: telaPrevisao, painel: telaPainel, relatorios: telaRelatorios,
+    inadimplencia: telaInadimplencia, previsao: telaPrevisao, painel: telaPainel, relatorios: telaRelatorios, importar: telaImportar,
     configuracoes: telaConfig, usuarios: telaUsuarios, historico: telaHistorico };
   (telas[rota] || telaClientes)().catch(e => { tela.innerHTML = `<p class="vazio">${esc(e.message)}</p>`; });
 }
@@ -556,6 +556,80 @@ function telaRelatorios() {
     location.href = `/api/relatorios/${f.dataset.tipo}?` + new URLSearchParams(p);
   });
   return Promise.resolve();
+}
+
+// ---------- importar do Virtua (administrador) ----------
+async function telaImportar() {
+  const cargas = await api("GET", "/api/importacao");
+  tela.innerHTML = `<h1>Importar do Virtua</h1>
+    <p class="sub">Enquanto o Virtua estiver em uso, ele é a fonte oficial: a importação <strong>substitui</strong> o que veio dele e
+      <strong>mantém</strong> o que foi criado aqui (clientes e contratos novos, observações). Baixas e alterações em parcelas do Virtua devem ser feitas no Virtua.</p>
+    <form class="cartao" id="f-imp" style="display:flex;flex-direction:column;gap:10px;max-width:640px">
+      <label class="campo"><span>Relatórios exportados do Virtua (.csv): o completo e o com e-mail. Pode selecionar os dois juntos.</span>
+        <input type="file" name="arquivos" accept=".csv,text/csv" multiple required></label>
+      <div class="erro-msg"></div>
+      <div><button class="btn prim">Analisar</button></div>
+    </form>
+    <div id="previa"></div>
+    <h2>Últimas importações</h2>
+    ${cargas.length ? `<div class="rolar"><table class="tabela"><thead><tr><th>Quando</th><th>Quem</th><th class="num">Clientes</th><th class="num">Parcelas</th><th class="num">Previsto</th><th class="num">Recebido</th></tr></thead><tbody>
+      ${cargas.map(c => `<tr><td>${quando(c.em)}</td><td>${esc(c.usuario)}</td><td class="num">${(c.depois?.clientes ?? "").toLocaleString("pt-BR")}</td>
+        <td class="num">${(c.depois?.parcelas ?? "").toLocaleString("pt-BR")}</td><td class="num">${c.depois?.previsto ? brl(c.depois.previsto) : ""}</td><td class="num">${c.depois?.recebido ? brl(c.depois.recebido) : ""}</td></tr>`).join("")}
+    </tbody></table></div>` : `<p class="vazio">Nenhuma importação ainda.</p>`}`;
+  const f = $("#f-imp");
+  f.onsubmit = async ev => {
+    ev.preventDefault();
+    const botao = $("button", f), erro = $(".erro-msg", f);
+    erro.textContent = ""; botao.disabled = true; botao.textContent = "Analisando…";
+    try {
+      const r = await fetch("/api/importacao/previa", { method: "POST", headers: { "x-virtua": "1" }, body: new FormData(f) });
+      const corpo = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(typeof corpo.detail === "string" ? corpo.detail : "Erro " + r.status);
+      desenharPrevia(corpo);
+    } catch (e) { erro.textContent = e.message; }
+    finally { botao.disabled = false; botao.textContent = "Analisar"; }
+  };
+}
+
+function desenharPrevia(p) {
+  const el = $("#previa"), n = v => Number(v).toLocaleString("pt-BR");
+  const linhaPg = x => `<tr><td>${esc(x.cliente)}</td><td>${dataBR(x.vencimento)}</td><td class="num">${brl(x.valor)}</td><td>${dataBR(x.pago_em)}</td><td class="num">${x.pago_em ? brl(x.valor_pago) : ""}</td></tr>`;
+  el.innerHTML = `<h2>Prévia</h2>
+    <p class="sub">Arquivos: ${Object.entries(p.arquivos).map(([t, a]) => `${t === "base" ? "completo" : "com e-mail"} = <strong>${esc(a)}</strong>`).join(" · ")}
+      ${p.sem_arquivo_email ? ' · <span style="color:var(--alerta)">sem o relatório com e-mail: os e-mails atuais são mantidos</span>' : ""}</p>
+    <div class="rolar" style="max-width:640px"><table class="tabela"><thead><tr><th>Conferência com o Virtua</th><th class="num">Virtua</th><th class="num">Lido</th><th></th></tr></thead><tbody>
+      ${p.conferencia.map(c => `<tr><td>${esc(c.item)}</td><td class="num">${c.item === "Parcelas" ? n(c.virtua) : brl(c.virtua)}</td><td class="num">${c.item === "Parcelas" ? n(c.lido) : brl(c.lido)}</td>
+        <td>${c.ok ? '<span class="selo s-paga">confere</span>' : '<span class="selo s-vencida">não bate</span>'}</td></tr>`).join("")}
+    </tbody></table></div>
+    <div class="cartoes" style="margin-top:14px">
+      <div class="cartao"><div class="rot">Clientes</div><div class="val">${n(p.contagens.clientes)}</div><div class="rot">${n(p.qtd_clientes_novos)} novos · ${n(p.qtd_clientes_sairam)} saíram · ${n(p.contagens.sem_email)} sem e-mail</div></div>
+      <div class="cartao"><div class="rot">Parcelas</div><div class="val">${n(p.contagens.parcelas)}</div><div class="rot">${n(p.parcelas_novas)} novas · ${n(p.parcelas_removidas)} removidas</div></div>
+      <div class="cartao"><div class="rot">Pagamentos novos</div><div class="val">${brl(p.valor_pagamentos_novos)}</div><div class="rot">${plural(p.qtd_pagamentos_novos, "parcela")}${p.qtd_estornos ? ` · ${n(p.qtd_estornos)} estornadas no Virtua` : ""}</div></div>
+      <div class="cartao"><div class="rot">Criado aqui e mantido</div><div class="val">${plural(p.mantidos.contratos, "contrato")}</div><div class="rot">${n(p.mantidos.clientes)} clientes · ${n(p.mantidos.parcelas)} parcelas</div></div>
+    </div>
+    ${p.conflitos.length ? `<div class="cartao" style="border-color:var(--erro);margin-bottom:14px"><strong style="color:var(--erro)">${plural(p.conflitos.length, "alteração", "alterações")} feita${p.conflitos.length === 1 ? "" : "s"} aqui em parcelas do Virtua ser${p.conflitos.length === 1 ? "á" : "ão"} substituída${p.conflitos.length === 1 ? "" : "s"}</strong>
+      <p class="sub" style="margin:4px 0 8px">Desde a última importação. Se forem pagamentos reais, lance também no Virtua antes de importar.</p>
+      <div class="rolar"><table class="tabela"><thead><tr><th>Quando</th><th>Quem</th><th>Cliente</th><th>Vencimento</th><th>O que mudou</th></tr></thead><tbody>
+      ${p.conflitos.map(c => `<tr><td>${quando(c.em)}</td><td>${esc(c.usuario)}</td><td>${esc(c.cliente)}</td><td>${dataBR(c.vencimento)}</td><td>${esc(c.mudou.join(", "))}</td></tr>`).join("")}</tbody></table></div>
+      <label style="display:block;margin-top:8px"><input type="checkbox" id="ciente"> Entendi; pode substituir</label></div>` : ""}
+    ${p.qtd_clientes_novos ? `<details class="cartao" style="margin-bottom:10px"><summary>${plural(p.qtd_clientes_novos, "cliente novo", "clientes novos")}</summary><p>${p.clientes_novos.map(esc).join(" · ")}${p.qtd_clientes_novos > p.clientes_novos.length ? " …" : ""}</p></details>` : ""}
+    ${p.qtd_pagamentos_novos ? `<details class="cartao" style="margin-bottom:10px"><summary>${plural(p.qtd_pagamentos_novos, "pagamento novo", "pagamentos novos")} (${brl(p.valor_pagamentos_novos)})</summary>
+      <div class="rolar"><table class="tabela"><thead><tr><th>Cliente</th><th>Vencimento</th><th class="num">Valor</th><th>Pago em</th><th class="num">Pago</th></tr></thead><tbody>${p.pagamentos_novos.map(linhaPg).join("")}</tbody></table></div></details>` : ""}
+    <div class="barra" style="margin-top:14px">
+      <button class="btn prim" id="confirmar"${p.pode_confirmar ? "" : " disabled"}>Confirmar importação</button>
+      <button class="btn" id="descartar">Descartar</button>
+      ${p.pode_confirmar ? "" : '<span style="color:var(--erro)">A conferência com os totais do Virtua não bateu. Exporte o relatório de novo.</span>'}
+    </div>`;
+  $("#descartar").onclick = () => { el.innerHTML = ""; $("#f-imp").reset(); };
+  $("#confirmar").onclick = async () => {
+    if (p.conflitos.length && !$("#ciente").checked) { avisar("Marque que entendeu antes de substituir"); return; }
+    const b = $("#confirmar"); b.disabled = true; b.textContent = "Importando…";
+    try {
+      const r = await api("POST", "/api/importacao/confirmar", { token: p.token });
+      avisar(`Importado: ${n(r.clientes)} clientes, ${n(r.parcelas)} parcelas`);
+      telaImportar();
+    } catch (e) { avisar(e.message); b.disabled = false; b.textContent = "Confirmar importação"; }
+  };
 }
 
 // ---------- histórico geral ----------

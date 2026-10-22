@@ -8,11 +8,11 @@ from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import config, db, security
+from . import config, db, importacao, security
 
 COOKIE = "virtua_sessao"
 FUSO = ZoneInfo("America/Sao_Paulo")  # o container roda em UTC
@@ -622,6 +622,65 @@ def painel(req: Request, de: str = "", ate: str = ""):
                coalesce((select sum(valor_pago) from virtua.v_parcelas x where date_trunc('month', x.pago_em) = m.mes), 0) as recebido
         from m order by m.mes""", p)
     return {"de": d1, "ate": d2, **tot, "meses": meses}
+
+
+# ---------- importar do Virtua (administrador) ----------
+# A prévia fica em memória até ser confirmada (1 worker; ver Dockerfile). Expira em 30 minutos.
+_importacoes: dict[str, dict] = {}
+MAX_ARQUIVO = 60 * 1024 * 1024
+
+
+@app.get("/api/importacao")
+def historico_importacoes(req: Request):
+    exigir(req, {"administrador"})
+    return db.all("""select em, usuario, depois from virtua.auditoria where acao = 'carga'
+                     order by em desc limit 20""")
+
+
+@app.post("/api/importacao/previa")
+def previa_importacao(req: Request, arquivos: list[UploadFile] = File(...)):
+    u = exigir(req, {"administrador"})
+    if not 1 <= len(arquivos) <= 2:
+        raise HTTPException(400, "Envie o relatório completo do Virtua e, se tiver, o relatório com e-mail")
+    lidos = []
+    for a in arquivos:
+        conteudo = a.file.read(MAX_ARQUIVO + 1)
+        if len(conteudo) > MAX_ARQUIVO:
+            raise HTTPException(400, f"{a.filename}: arquivo maior que 60 MB")
+        lidos.append((a.filename or "arquivo", conteudo))
+    try:
+        dados = importacao.ler_arquivos(lidos)
+    except (importacao.ArquivoInvalido, ValueError, KeyError, InvalidOperation) as e:
+        raise HTTPException(400, f"Não consegui ler: {e}")
+    with db.pool.connection() as con:
+        p = importacao.previa(con, dados)
+        ultima = con.execute("select coalesce(max(id), 0) as id from virtua.auditoria where acao = 'carga'").fetchone()["id"]
+    agora = time.time()
+    for k in [k for k, v in _importacoes.items() if agora - v["criado"] > 1800]:
+        del _importacoes[k]
+    token = uuid.uuid4().hex
+    _importacoes[token] = {"dados": dados, "usuario": u["id"], "criado": agora, "ultima_carga": ultima,
+                           "pode": p["pode_confirmar"]}
+    return {**p, "token": token}
+
+
+@app.post("/api/importacao/confirmar")
+async def confirmar_importacao(req: Request):
+    u = exigir(req, {"administrador"})
+    b = await corpo(req)
+    imp = _importacoes.get(str(b.get("token")))
+    if not imp or imp["usuario"] != u["id"] or time.time() - imp["criado"] > 1800:
+        raise HTTPException(410, "A prévia expirou. Envie os arquivos de novo.")
+    if not imp["pode"]:
+        raise HTTPException(409, "A conferência com os totais do Virtua não bateu; a importação foi bloqueada")
+    with db.tx(u["email"]) as con:
+        con.execute("lock table virtua.parcelas in exclusive mode")
+        ultima = con.execute("select coalesce(max(id), 0) as id from virtua.auditoria where acao = 'carga'").fetchone()["id"]
+        if ultima != imp["ultima_carga"]:
+            raise HTTPException(409, "Outra importação foi feita depois desta prévia. Envie os arquivos de novo.")
+        resumo = importacao.aplicar(con, imp["dados"], u["email"])
+    _importacoes.pop(str(b.get("token")), None)
+    return resumo
 
 
 # ---------- relatórios (Excel / CSV) ----------

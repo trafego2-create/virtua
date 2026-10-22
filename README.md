@@ -13,9 +13,10 @@ cp .env.example .env   # DATABASE_URL=postgresql://postgres:dev@localhost:54329/
 ```
 Na primeira abertura, a tela pede para criar a conta do administrador.
 
-## Migração da carteira
-1. `scripts/normalizar.py`: lê `Downloads\Base Virtua.csv` (valores) + `Downloads\Grade Excel 04.csv` (e-mail/UF) e gera `data/saida/*.csv` + `conferencia.txt` (antigo x novo).
-2. `scripts/carregar.py`: grava no banco numa transação; confere os totais antes de confirmar. Recusa se já houver alterações feitas pelo sistema (use `--forcar` só antes da virada).
+## Carga da carteira (Virtua)
+- **Pela tela** (administrador): menu *Importar*. Sobe o relatório completo do Virtua (+ o relatório com e-mail), vê a prévia e confirma.
+- **Por script:** `scripts/carregar.py [completo.csv] [email.csv]` (padrão: os dois arquivos em Downloads).
+- Os dois usam `app/importacao.py`: substitui o que veio do Virtua, mantém o que foi criado no sistema, confere os totais com a linha de totais do Virtua e não grava se não bater.
 
 ## Regras
 - Parcela original citada num acordo = `renegociada` (não conta como atraso).
