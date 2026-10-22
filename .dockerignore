@@ -1,0 +1,8 @@
+.venv/
+data/
+devdb/
+.env
+.env.*
+tests/
+scripts/
+__pycache__/

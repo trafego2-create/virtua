@@ -1,0 +1,7 @@
+data/
+devdb/
+.venv/
+__pycache__/
+.env
+.env.*
+!.env.example
