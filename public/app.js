@@ -20,7 +20,9 @@ const brl = v => Number(v || 0).toLocaleString("pt-BR", { style: "currency", cur
 const dataBR = v => (v ? String(v).slice(0, 10).split("-").reverse().join("/") : "");
 const quando = v => (v ? new Date(v).toLocaleString("pt-BR") : "");
 const selo = s => `<span class="selo s-${esc(s)}">${esc(ROTULO[s] || s)}</span>`;
-const hoje = () => new Date().toISOString().slice(0, 10);
+const isoLocal = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+const hoje = () => isoLocal(new Date());  // data local (toISOString é UTC e vira o dia depois das 21h)
+const plural = (n, palavra) => `${Number(n).toLocaleString("pt-BR")} ${palavra}${Number(n) === 1 ? "" : "s"}`;
 
 async function api(metodo, url, corpo) {
   const r = await fetch(url, {
@@ -124,11 +126,12 @@ $("#btn-senha").onclick = () => perguntar("Trocar senha", [
 function rotear() {
   if (!EU) return;
   const [, rota, arg] = (location.hash || "#/clientes").split("/");
-  const itens = [["clientes", "Clientes"]];
+  const itens = [["painel", "Painel"], ["clientes", "Clientes"], ["inadimplencia", "Inadimplência"], ["previsao", "Previsão"], ["relatorios", "Relatórios"]];
   if (EU.perfil === "administrador") itens.push(["configuracoes", "Configurações"], ["usuarios", "Usuários"]);
   if (["administrador", "gestor"].includes(EU.perfil)) itens.push(["historico", "Histórico"]);
   $("#menu").innerHTML = itens.map(([r, t]) => `<a href="#/${r}" class="${(rota === r || (rota === "cliente" && r === "clientes")) ? "ativo" : ""}">${t}</a>`).join("");
   const telas = { clientes: telaClientes, cliente: () => telaFicha(decodeURIComponent(arg || "")),
+    inadimplencia: telaInadimplencia, previsao: telaPrevisao, painel: telaPainel, relatorios: telaRelatorios,
     configuracoes: telaConfig, usuarios: telaUsuarios, historico: telaHistorico };
   (telas[rota] || telaClientes)().catch(e => { tela.innerHTML = `<p class="vazio">${esc(e.message)}</p>`; });
 }
@@ -362,6 +365,197 @@ async function telaUsuarios() {
     ], "Salvar", v => api("PATCH", "/api/usuarios/" + u.id, { perfil: v.perfil, ativo: !!v.ativo, senha: v.senha || undefined }))
       .then(v => v && (avisar("Usuário atualizado"), telaUsuarios()));
   });
+}
+
+// ---------- gráfico de barras (SVG próprio, sem biblioteca) ----------
+// series: [{nome, cor: "var(--serie-1)", valores: [...]}] · categorias: rótulos do eixo X
+function graficoBarras(el, { categorias, series, rotuloDica = c => c, alturaPx = 240 }) {
+  const larg = Math.max(320, el.clientWidth || 800), alt = alturaPx;
+  const m = { t: 10, r: 8, b: 26, l: 64 };
+  const w = larg - m.l - m.r, h = alt - m.t - m.b;
+  const maxV = Math.max(1, ...series.flatMap(s => s.valores));
+  const passo = 10 ** Math.floor(Math.log10(maxV)), topo = Math.ceil(maxV / passo) * passo;
+  const ticks = [0, .25, .5, .75, 1].map(f => f * topo);
+  const y = v => m.t + h - (v / topo) * h;
+  const grupo = w / categorias.length, barra = Math.max(2, Math.min(28, (grupo * 0.72) / series.length - 2));
+  const curto = v => v >= 1e6 ? `R$ ${(v / 1e6).toLocaleString("pt-BR", { maximumFractionDigits: 1 })} mi` : v >= 1e3 ? `R$ ${(v / 1e3).toLocaleString("pt-BR", { maximumFractionDigits: v < 1e4 ? 1 : 0 })} mil` : brl(v);
+  const cada = Math.ceil(categorias.length / Math.max(1, Math.floor(w / 46)));  // rótulos X sem colidir
+  let svg = `<svg viewBox="0 0 ${larg} ${alt}" role="img" aria-label="${esc(series.map(s => s.nome).join(" e "))}">`;
+  svg += ticks.map(t => `<line x1="${m.l}" x2="${larg - m.r}" y1="${y(t)}" y2="${y(t)}" stroke="var(--grade)"/><text x="${m.l - 8}" y="${y(t) + 4}" text-anchor="end">${curto(t)}</text>`).join("");
+  categorias.forEach((c, i) => {
+    const x0 = m.l + i * grupo + (grupo - (barra + 2) * series.length) / 2;
+    series.forEach((s, j) => {
+      const v = s.valores[i], x = x0 + j * (barra + 2), yt = y(v), r = Math.min(4, barra / 2, (m.t + h - yt));
+      if (v > 0) svg += `<path d="M${x},${m.t + h} V${yt + r} Q${x},${yt} ${x + r},${yt} H${x + barra - r} Q${x + barra},${yt} ${x + barra},${yt + r} V${m.t + h} Z" fill="${s.cor}"/>`;
+    });
+    if (i % cada === 0) svg += `<text x="${m.l + i * grupo + grupo / 2}" y="${alt - 8}" text-anchor="middle">${esc(c)}</text>`;
+    svg += `<rect x="${m.l + i * grupo}" y="${m.t}" width="${grupo}" height="${h}" fill="transparent" data-i="${i}"/>`;
+  });
+  svg += `<line x1="${m.l}" x2="${larg - m.r}" y1="${m.t + h}" y2="${m.t + h}" stroke="var(--suave)" stroke-opacity=".5"/></svg>`;
+  el.innerHTML = (series.length > 1 ? `<div class="legenda">${series.map(s => `<span><i style="background:${s.cor}"></i>${esc(s.nome)}</span>`).join("")}</div>` : "") + svg + `<div class="dica"></div>`;
+  const dica = $(".dica", el);
+  el.querySelectorAll("rect[data-i]").forEach(r => {
+    r.onmouseenter = () => {
+      const i = +r.dataset.i;
+      dica.innerHTML = `<strong>${esc(rotuloDica(categorias[i], i))}</strong><br>` + series.map(s => `${esc(s.nome)}: ${brl(s.valores[i])}`).join("<br>");
+      dica.classList.add("mostra");
+    };
+    r.onmousemove = ev => { const b = el.getBoundingClientRect(); dica.style.left = Math.min(ev.clientX - b.left + 12, b.width - dica.offsetWidth - 4) + "px"; dica.style.top = (ev.clientY - b.top - dica.offsetHeight - 8) + "px"; };
+    r.onmouseleave = () => dica.classList.remove("mostra");
+  });
+}
+const MESES = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"];
+const mesCurto = iso => `${MESES[+iso.slice(5, 7) - 1]}/${iso.slice(2, 4)}`;
+
+// ---------- painel ----------
+const filtroPainel = { de: `${new Date().getFullYear()}-01-01`, ate: hoje() };
+
+async function telaPainel() {
+  const r = await api("GET", "/api/painel?" + new URLSearchParams(filtroPainel));
+  const pct = Number(r.previsto) ? (Number(r.vencido_periodo) / Number(r.previsto) * 100) : 0;
+  const realizadoPct = Number(r.previsto) ? (Number(r.realizado) / Number(r.previsto) * 100) : 0;
+  tela.innerHTML = `<h1>Painel financeiro</h1><p class="sub">Período pela data de vencimento; "recebido" pela data do pagamento.</p>
+    <form class="filtros" id="f-painel">
+      <label class="campo"><span>De</span><input type="date" name="de" value="${esc(filtroPainel.de)}"></label>
+      <label class="campo"><span>Até</span><input type="date" name="ate" value="${esc(filtroPainel.ate)}"></label>
+      <button class="btn">Aplicar</button>
+      <button class="btn" type="button" data-p="mes">Este mês</button><button class="btn" type="button" data-p="ano">Este ano</button><button class="btn" type="button" data-p="12m">Últimos 12 meses</button>
+    </form>
+    <div class="cartoes">
+      <div class="cartao"><div class="rot">Previsto no período</div><div class="val">${brl(r.previsto)}</div></div>
+      <div class="cartao"><div class="rot">Realizado (das previstas)</div><div class="val">${brl(r.realizado)}</div><div class="rot">${realizadoPct.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}% do previsto</div></div>
+      <div class="cartao"><div class="rot">Recebido no período</div><div class="val">${brl(r.recebido)}</div></div>
+      <div class="cartao"><div class="rot">Inadimplência do período</div><div class="val">${brl(r.vencido_periodo)}</div><div class="rot">${pct.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}% do previsto</div></div>
+    </div>
+    <div class="cartoes">
+      <div class="cartao"><div class="rot">A receber (hoje, total)</div><div class="val">${brl(r.a_receber)}</div></div>
+      <div class="cartao"><div class="rot">Atrasado (total)</div><div class="val">${brl(r.vencido_total)}</div></div>
+      <div class="cartao"><div class="rot">A vencer (total)</div><div class="val">${brl(r.a_vencer)}</div></div>
+      <div class="cartao"><div class="rot">Boletos no período</div><div class="val">${r.boletos_emitidos}</div><div class="rot">${r.boletos_pagos} pagos · ${r.boletos_vencidos} vencidos · ${r.boletos_em_aberto} em aberto</div></div>
+    </div>
+    <div class="grafico"><h2>Previsto x realizado por mês</h2><p class="sub" style="margin:0">Realizado = quanto das parcelas que venciam no mês já foi pago.</p><div id="g-painel"></div></div>
+    <div class="rolar"><table class="tabela"><thead><tr><th>Mês</th><th class="num">Previsto</th><th class="num">Realizado</th><th class="num">% realizado</th><th class="num">Recebido no mês</th></tr></thead><tbody>
+      ${r.meses.map(x => `<tr><td>${mesCurto(x.mes)}</td><td class="num">${brl(x.previsto)}</td><td class="num">${brl(x.realizado)}</td>
+        <td class="num">${Number(x.previsto) ? (Number(x.realizado) / Number(x.previsto) * 100).toLocaleString("pt-BR", { maximumFractionDigits: 1 }) + "%" : "—"}</td><td class="num">${brl(x.recebido)}</td></tr>`).join("")}
+    </tbody></table></div>`;
+  graficoBarras($("#g-painel"), {
+    categorias: r.meses.map(x => mesCurto(x.mes)),
+    series: [{ nome: "Previsto", cor: "var(--serie-1)", valores: r.meses.map(x => Number(x.previsto)) },
+             { nome: "Realizado", cor: "var(--serie-2)", valores: r.meses.map(x => Number(x.realizado)) }],
+  });
+  const f = $("#f-painel");
+  f.onsubmit = ev => { ev.preventDefault(); filtroPainel.de = f.de.value; filtroPainel.ate = f.ate.value; telaPainel().catch(e => avisar(e.message)); };
+  f.querySelectorAll("[data-p]").forEach(b => b.onclick = () => {
+    const d = new Date();
+    filtroPainel.ate = hoje();
+    filtroPainel.de = isoLocal({ mes: new Date(d.getFullYear(), d.getMonth(), 1), ano: new Date(d.getFullYear(), 0, 1),
+                                 "12m": new Date(d.getFullYear(), d.getMonth() - 11, 1) }[b.dataset.p]);
+    telaPainel().catch(e => avisar(e.message));
+  });
+}
+
+// ---------- inadimplência ----------
+const filtroInad = { carteira: "ativa", faixa: "", q: "", de: "", ate: "", minimo: "", maximo: "", ordem: "valor", pagina: 1 };
+const ROTULO_FAIXA = { hoje: "Vence hoje", "1-7": "1 a 7 dias", "8-30": "8 a 30 dias", "31-60": "31 a 60 dias", "60+": "Acima de 60 dias" };
+
+async function telaInadimplencia() {
+  tela.innerHTML = `<h1>Inadimplência</h1><p class="sub">Parcelas em aberto vencidas (e as que vencem hoje), por cliente. Renegociadas em acordo não entram.</p>
+    <div class="faixas" id="faixas"></div>
+    <form class="filtros" id="f-inad">
+      <label class="campo"><span>Carteira</span><select name="carteira">${[["ativa", "Carteira ativa"], ["inadimplencia_antiga", "Inadimplência antiga"], ["", "Todas"]]
+        .map(([v, t]) => `<option value="${v}"${filtroInad.carteira === v ? " selected" : ""}>${t}</option>`).join("")}</select></label>
+      <label class="campo" style="flex:1;min-width:220px"><span>Cliente</span><input type="search" name="q" placeholder="Nome, CPF, e-mail ou telefone" value="${esc(filtroInad.q)}"></label>
+      <label class="campo"><span>Vencimento de</span><input type="date" name="de" value="${esc(filtroInad.de)}"></label>
+      <label class="campo"><span>até</span><input type="date" name="ate" value="${esc(filtroInad.ate)}"></label>
+      <label class="campo"><span>Valor de (R$)</span><input type="number" step="0.01" name="minimo" style="width:110px" value="${esc(filtroInad.minimo)}"></label>
+      <label class="campo"><span>até (R$)</span><input type="number" step="0.01" name="maximo" style="width:110px" value="${esc(filtroInad.maximo)}"></label>
+      <label class="campo"><span>Ordenar</span><select name="ordem">${[["valor", "Maior valor"], ["atraso", "Mais dias de atraso"], ["antigo", "Vencimento mais antigo"], ["nome", "Nome"]]
+        .map(([v, t]) => `<option value="${v}"${filtroInad.ordem === v ? " selected" : ""}>${t}</option>`).join("")}</select></label>
+      <button class="btn prim">Filtrar</button>
+      <button class="btn" type="button" id="exp-inad">Baixar Excel</button>
+    </form><div id="lista-inad"></div>`;
+  const f = $("#f-inad");
+  f.onsubmit = ev => { ev.preventDefault(); Object.assign(filtroInad, Object.fromEntries(new FormData(f)), { pagina: 1 }); carregarInad(); };
+  $("#exp-inad").onclick = () => { const { pagina, ordem, ...p } = filtroInad; location.href = "/api/relatorios/inadimplencia?" + new URLSearchParams(p); };
+  $("#faixas").onclick = ev => { const b = ev.target.closest(".faixa"); if (!b) return; filtroInad.faixa = filtroInad.faixa === b.dataset.f ? "" : b.dataset.f; filtroInad.pagina = 1; carregarInad(); };
+  carregarInad();
+}
+
+async function carregarInad() {
+  const r = await api("GET", "/api/inadimplencia?" + new URLSearchParams(filtroInad));
+  $("#faixas").innerHTML = ["hoje", "1-7", "8-30", "31-60", "60+"].map(k => {
+    const x = r.faixas[k] || { valor: 0, clientes: 0, parcelas: 0 };
+    return `<button class="faixa${filtroInad.faixa === k ? " ativo" : ""}" data-f="${k}"><div class="rot">${ROTULO_FAIXA[k]}</div><div class="val">${brl(x.valor)}</div><small>${plural(x.clientes, "cliente")} · ${plural(x.parcelas, "parcela")}</small></button>`;
+  }).join("");
+  const paginas = Math.max(1, Math.ceil(r.total / r.por_pagina));
+  $("#lista-inad").innerHTML = r.clientes.length ? `<p class="sub">${r.total.toLocaleString("pt-BR")} clientes${filtroInad.faixa ? ` na faixa "${ROTULO_FAIXA[filtroInad.faixa]}"` : ""} · ${brl(r.valor_total)} atrasado</p>
+    <div class="rolar"><table class="tabela"><thead><tr><th>Cliente</th><th>Contato</th><th class="num">Parcelas</th><th class="num">Atrasado</th><th class="num">Com juros e multa</th><th class="num">Dias de atraso</th><th>Venc. mais antigo</th><th>Último pagamento</th></tr></thead><tbody>
+    ${r.clientes.map(c => `<tr class="clica" data-c="${esc(c.codigo)}"><td><strong>${esc(c.nome)}</strong><br><small class="sub">${esc(c.cpf_cnpj)} · ${selo(c.carteira)}</small></td>
+      <td>${esc(c.telefone || "")}<br><small class="sub">${esc(c.email || "sem e-mail")}</small></td>
+      <td class="num">${c.parcelas_vencidas}</td><td class="num">${brl(c.valor_vencido)}</td><td class="num">${brl(c.valor_atualizado)}</td>
+      <td class="num">${c.maior_atraso}</td><td>${dataBR(c.vencimento_mais_antigo)}</td><td>${dataBR(c.ultimo_pagamento)}</td></tr>`).join("")}
+    </tbody></table></div>
+    <div class="pag">página ${r.pagina} de ${paginas}
+      <button class="btn peq" id="ant-i"${r.pagina <= 1 ? " disabled" : ""}>Anterior</button><button class="btn peq" id="prox-i"${r.pagina >= paginas ? " disabled" : ""}>Próxima</button></div>`
+    : `<p class="vazio">Nenhum cliente com atraso neste filtro.</p>`;
+  $("#lista-inad tbody")?.addEventListener("click", ev => { const tr = ev.target.closest("tr[data-c]"); if (tr) location.hash = "#/cliente/" + encodeURIComponent(tr.dataset.c); });
+  if ($("#ant-i")) $("#ant-i").onclick = () => { filtroInad.pagina--; carregarInad(); };
+  if ($("#prox-i")) $("#prox-i").onclick = () => { filtroInad.pagina++; carregarInad(); };
+}
+
+// ---------- previsão de recebimentos ----------
+let diasPrevisao = 30;
+
+async function telaPrevisao() {
+  const r = await api("GET", "/api/previsao?dias=" + diasPrevisao);
+  tela.innerHTML = `<h1>Previsão de recebimentos</h1><p class="sub">Parcelas em aberto que ainda vão vencer. Não inclui o que já está atrasado.</p>
+    <div class="cartoes">
+      <div class="cartao"><div class="rot">Hoje</div><div class="val">${brl(r.hoje)}</div></div>
+      <div class="cartao"><div class="rot">Amanhã</div><div class="val">${brl(r.amanha)}</div></div>
+      <div class="cartao"><div class="rot">Próximos 7 dias</div><div class="val">${brl(r.em_7_dias)}</div></div>
+      <div class="cartao"><div class="rot">Próximos 30 dias</div><div class="val">${brl(r.em_30_dias)}</div></div>
+      <div class="cartao"><div class="rot">Todo o futuro</div><div class="val">${brl(r.futuro_total)}</div><div class="rot">${r.parcelas_futuras} parcelas</div></div>
+    </div>
+    <p class="sub">Além disso, há <strong>${brl(r.vencido)}</strong> em parcelas atrasadas (veja <a href="#/inadimplencia">Inadimplência</a>).</p>
+    <div class="grafico"><div class="cab-ficha"><h2>Entrada prevista por dia</h2>
+      <div class="chips" id="dias">${[30, 60, 90].map(d => `<button class="chip${diasPrevisao === d ? " ativo" : ""}" data-d="${d}">${d} dias</button>`).join("")}</div></div>
+      <div id="g-prev"></div></div>
+    <h2>Parcelas que vencem nos próximos ${r.dias} dias</h2>
+    ${r.parcelas.length ? `<div class="rolar"><table class="tabela"><thead><tr><th>Vencimento</th><th>Cliente</th><th>Contrato / acordo</th><th class="num">Parcela</th><th class="num">Valor</th></tr></thead><tbody>
+      ${r.parcelas.map(p => `<tr class="clica" data-c="${esc(p.codigo)}"><td>${dataBR(p.vencimento)}</td><td>${esc(p.nome)}</td><td>${p.nr_acordo ? "Acordo " + esc(p.nr_acordo) : esc(p.conta || "")}</td><td class="num">${esc(p.nr_parcela ?? "")}</td><td class="num">${brl(p.valor_previsto)}</td></tr>`).join("")}
+    </tbody></table></div>` : `<p class="vazio">Nenhuma parcela vence neste período.</p>`}`;
+  graficoBarras($("#g-prev"), {
+    categorias: r.serie.map(s => dataBR(s.dia).slice(0, 5)),
+    series: [{ nome: "Entrada prevista", cor: "var(--serie-1)", valores: r.serie.map(s => Number(s.valor)) }],
+    rotuloDica: (c, i) => `${dataBR(r.serie[i].dia)} · ${r.serie[i].parcelas} parcela(s)`,
+    alturaPx: 200,
+  });
+  $("#dias").onclick = ev => { const b = ev.target.closest("[data-d]"); if (!b) return; diasPrevisao = +b.dataset.d; telaPrevisao().catch(e => avisar(e.message)); };
+  tela.querySelector("tbody")?.addEventListener("click", ev => { const tr = ev.target.closest("tr[data-c]"); if (tr) location.hash = "#/cliente/" + encodeURIComponent(tr.dataset.c); });
+}
+
+// ---------- relatórios ----------
+function telaRelatorios() {
+  const carteira = `<label class="campo"><span>Carteira</span><select name="carteira"><option value="ativa">Carteira ativa</option><option value="ativa_em_atraso">Ativa · em atraso</option><option value="ativa_em_dia">Ativa · em dia</option><option value="inadimplencia_antiga">Inadimplência antiga</option><option value="">Todas</option></select></label>`;
+  const periodo = rot => `<div class="grade2"><label class="campo"><span>${rot} de</span><input type="date" name="de"></label><label class="campo"><span>até</span><input type="date" name="ate"></label></div>`;
+  const formato = `<label class="campo"><span>Formato</span><select name="formato"><option value="xlsx">Excel (.xlsx)</option><option value="csv">CSV</option></select></label>`;
+  const rels = [
+    ["clientes", "Clientes", "Cadastro completo com totais de cada cliente: contratado, recebido, em aberto e atrasado.", carteira],
+    ["parcelas", "Cobranças", "Todas as parcelas com situação, vencimento, pagamento e nosso número.",
+      carteira + `<label class="campo"><span>Situação</span><select name="status"><option value="">Todas</option><option value="vencida">Vencidas</option><option value="a_vencer">A vencer</option><option value="paga">Pagas</option><option value="renegociada">Renegociadas</option><option value="cancelada">Canceladas</option></select></label>` + periodo("Vencimento")],
+    ["recebimentos", "Recebimentos", "Pagamentos recebidos, pela data do pagamento.", carteira + periodo("Pagamento")],
+    ["inadimplencia", "Inadimplência", "Clientes com parcelas atrasadas, por valor. Mesmos filtros da tela de Inadimplência.",
+      carteira + `<label class="campo"><span>Faixa de atraso</span><select name="faixa"><option value="">Todas</option>${Object.entries(ROTULO_FAIXA).map(([k, t]) => `<option value="${k}">${t}</option>`).join("")}</select></label>` + periodo("Vencimento")],
+  ];
+  tela.innerHTML = `<h1>Relatórios</h1><p class="sub">Escolha os filtros e baixe. O Excel já vem com filtro nas colunas e valores em reais.</p>
+    <div class="relatorios">${rels.map(([tipo, nome, desc, campos]) => `<form class="cartao" data-tipo="${tipo}"><h2>${nome}</h2><p class="sub" style="margin:0">${desc}</p>${campos}${formato}<button class="btn prim">Baixar</button></form>`).join("")}</div>`;
+  tela.querySelectorAll("form[data-tipo]").forEach(f => f.onsubmit = ev => {
+    ev.preventDefault();
+    const p = Object.fromEntries([...new FormData(f)].filter(([, v]) => v !== ""));
+    if (!("carteira" in p)) p.carteira = "";
+    location.href = `/api/relatorios/${f.dataset.tipo}?` + new URLSearchParams(p);
+  });
+  return Promise.resolve();
 }
 
 // ---------- histórico geral ----------

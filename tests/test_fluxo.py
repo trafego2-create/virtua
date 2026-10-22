@@ -111,6 +111,33 @@ def main():
         eu = next(u["id"] for u in adm.get("/api/usuarios").json() if u["email"] == "adm@teste.com")
         checar(adm.patch(f"/api/usuarios/{eu}", json={"perfil": "consulta"}, headers=H).status_code == 400, "admin não tira o próprio acesso")
 
+        # 2ª entrega: inadimplência, previsão, painel, relatórios
+        inad = adm.get("/api/inadimplencia").json()
+        soma_faixas = round(sum(float(f["valor"]) for f in inad["faixas"].values()), 2)
+        checar(soma_faixas == round(float(inad["valor_total"]), 2), "faixas de atraso somam o total da inadimplência")
+        checar(set(inad["faixas"]) <= {"hoje", "1-7", "8-30", "31-60", "60+"}, "faixas são as do documento")
+        so60 = adm.get("/api/inadimplencia", params={"faixa": "60+"}).json()
+        checar(all(c["maior_atraso"] > 60 for c in so60["clientes"]), "filtro de faixa +60 só traz atraso acima de 60 dias")
+        checar(all(float(c["valor_vencido"]) >= 1000 for c in adm.get("/api/inadimplencia", params={"minimo": "1000"}).json()["clientes"]),
+               "filtro de valor mínimo")
+        checar(adm.get("/api/inadimplencia", params={"minimo": "abc"}).status_code == 400, "valor mínimo inválido é recusado")
+        prev = adm.get("/api/previsao", params={"dias": 60}).json()
+        checar(len(prev["serie"]) == 61 and float(prev["em_7_dias"]) <= float(prev["em_30_dias"]) <= float(prev["futuro_total"]),
+               "previsão: série diária e marcos crescentes")
+        pn = adm.get("/api/painel", params={"de": "2025-01-01", "ate": "2025-12-31"}).json()
+        checar(len(pn["meses"]) == 12 and round(sum(float(m["previsto"]) for m in pn["meses"]), 2) == round(float(pn["previsto"]), 2),
+               "painel: 12 meses somam o previsto do período")
+        checar(adm.get("/api/painel", params={"de": "2026-05-01", "ate": "2026-01-01"}).status_code == 400, "painel recusa período invertido")
+        import io
+        from openpyxl import load_workbook
+        for tipo in ("clientes", "parcelas", "recebimentos", "inadimplencia"):
+            x = con_.get(f"/api/relatorios/{tipo}", params={"carteira": "ativa"})
+            ws = load_workbook(io.BytesIO(x.content)).active
+            checar(x.status_code == 200 and ws.max_row > 1, f"relatório {tipo} em Excel abre ({ws.max_row - 1} linhas)")
+        csv_txt = con_.get("/api/relatorios/clientes", params={"formato": "csv", "carteira": "ativa"}).content.decode("utf-8-sig")
+        checar(csv_txt.splitlines()[0].startswith("Código;Nome") and len(csv_txt.splitlines()) == 1285, "relatório em CSV (1.284 clientes ativos)")
+        checar(adm.get("/api/relatorios/xyz").status_code == 404, "relatório desconhecido dá 404")
+
         ruim = novo_cliente()
         for _ in range(8):
             ruim.post("/api/login", json={"email": "adm@teste.com", "senha": "errada"})

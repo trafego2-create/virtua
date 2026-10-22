@@ -166,6 +166,10 @@ begin
   end loop;
 end $$;
 
+-- "Hoje" no fuso de Brasília: o banco roda em UTC, e virtua.hoje() viraria o dia seguinte às 21h.
+create or replace function virtua.hoje() returns date
+language sql stable as $$ select (now() at time zone 'America/Sao_Paulo')::date $$;
+
 -- ---------- leitura: status, atraso, valor atualizado e carteira ----------
 create or replace view virtua.v_parcelas as
 with cfg as (
@@ -175,13 +179,13 @@ with cfg as (
 )
 select p.*,
        case when p.situacao <> 'aberta' then p.situacao
-            when p.vencimento < current_date then 'vencida'
+            when p.vencimento < virtua.hoje() then 'vencida'
             else 'a_vencer' end                                                   as status,
-       case when p.situacao = 'aberta' and p.vencimento < current_date
-            then current_date - p.vencimento else 0 end                           as dias_atraso,
-       case when p.situacao = 'aberta' and p.vencimento < current_date
+       case when p.situacao = 'aberta' and p.vencimento < virtua.hoje()
+            then virtua.hoje() - p.vencimento else 0 end                           as dias_atraso,
+       case when p.situacao = 'aberta' and p.vencimento < virtua.hoje()
             then round(p.valor_previsto * (1 + cfg.multa_pct / 100
-                       + cfg.juros_mes_pct / 100 * (current_date - p.vencimento) / 30.0), 2)
+                       + cfg.juros_mes_pct / 100 * (virtua.hoje() - p.vencimento) / 30.0), 2)
             else p.valor_previsto end                                             as valor_atualizado
 from virtua.parcelas p cross join cfg;
 

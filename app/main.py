@@ -4,8 +4,9 @@ import time
 import uuid
 from collections import defaultdict
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse
@@ -14,6 +15,12 @@ from fastapi.staticfiles import StaticFiles
 from . import config, db, security
 
 COOKIE = "virtua_sessao"
+FUSO = ZoneInfo("America/Sao_Paulo")  # o container roda em UTC
+
+
+def hoje() -> date:
+    return datetime.now(FUSO).date()
+
 PERFIS = ("administrador", "gestor", "financeiro", "consulta")
 EDITA_CARTEIRA = {"administrador", "financeiro"}
 VE_HISTORICO = {"administrador", "gestor"}
@@ -200,10 +207,10 @@ def resumo(req: Request):
                coalesce(sum(valor_previsto) filter (where status = 'vencida'), 0)               as vencido,
                coalesce(sum(valor_previsto) filter (where status = 'a_vencer'), 0)              as a_vencer,
                coalesce(sum(valor_previsto) filter (where status = 'vencida'
-                        and vencimento >= date_trunc('year', current_date)), 0)                 as vencido_ano
+                        and vencimento >= date_trunc('year', virtua.hoje())), 0)                 as vencido_ano
         from virtua.v_parcelas""")
     c = db.all("select carteira, count(*) as n from virtua.v_clientes group by carteira")
-    return {**p, "ano": date.today().year, "carteira": {r["carteira"]: r["n"] for r in c}}
+    return {**p, "ano": hoje().year, "carteira": {r["carteira"]: r["n"] for r in c}}
 
 
 # ---------- clientes ----------
@@ -366,7 +373,7 @@ async def alterar_parcela(pid: int, req: Request):
             if p["situacao"] != "aberta":
                 raise HTTPException(409, "Só dá para dar baixa em parcela em aberto")
             pago_em = dia(b.get("pago_em"), "Data do pagamento")
-            if pago_em > date.today():
+            if pago_em > hoje():
                 raise HTTPException(400, "Data do pagamento não pode ser no futuro")
             con.execute("update virtua.parcelas set situacao = 'paga', pago_em = %s, valor_pago = %s where id = %s",
                         (pago_em, dinheiro(b.get("valor_pago"), "Valor pago"), pid))
@@ -473,6 +480,264 @@ async def alterar_usuario(uid: int, req: Request):
 def auditoria(req: Request, pagina: int = 1):
     exigir(req, VE_HISTORICO)
     return db.all("select * from virtua.auditoria order by em desc limit 100 offset %s", ((max(1, pagina) - 1) * 100,))
+
+
+# ---------- gestão: inadimplência, previsão, painel ----------
+FAIXAS = ("hoje", "1-7", "8-30", "31-60", "60+")
+SQL_FAIXA = """case when virtua.hoje() - p.vencimento = 0 then 'hoje'
+                    when virtua.hoje() - p.vencimento <= 7 then '1-7'
+                    when virtua.hoje() - p.vencimento <= 30 then '8-30'
+                    when virtua.hoje() - p.vencimento <= 60 then '31-60'
+                    else '60+' end"""
+
+
+def data_opcional(v: str | None, campo: str) -> date | None:
+    return dia(v, campo) if v else None
+
+
+def filtro_cliente(q: str, carteira: str, alias: str = "c") -> tuple[str, dict]:
+    """Condições sobre v_clientes (busca + carteira), com parâmetros nomeados."""
+    conds, params = [], {}
+    if q.strip():
+        termo = q.strip()
+        params |= {"q_like": f"%{termo}%", "q_exato": termo}
+        cond = f"({alias}.nome ilike %(q_like)s or {alias}.email ilike %(q_like)s or {alias}.codigo = %(q_exato)s"
+        digitos = re.sub(r"\D", "", termo)
+        if len(digitos) >= 3:
+            params["q_dig"] = f"%{digitos}%"
+            cond += f" or regexp_replace({alias}.cpf_cnpj, '\\D', '', 'g') like %(q_dig)s or {alias}.telefone like %(q_dig)s"
+        conds.append(cond + ")")
+    if carteira == "ativa":
+        conds.append(f"{alias}.carteira like 'ativa%%'")
+    elif carteira in ("ativa_em_dia", "ativa_em_atraso", "inadimplencia_antiga"):
+        conds.append(f"{alias}.carteira = %(carteira)s")
+        params["carteira"] = carteira
+    return " and ".join(conds) or "true", params
+
+
+def consulta_inadimplencia(q, carteira, faixa, de, ate, minimo, maximo, ordem, limite, offset):
+    cond_cli, params = filtro_cliente(q, carteira)
+    params |= {"de": data_opcional(de, "De"), "ate": data_opcional(ate, "Até"),
+               "faixa": faixa if faixa in FAIXAS else None,
+               "min": dinheiro(minimo, "Valor mínimo") if minimo else None,
+               "max": dinheiro(maximo, "Valor máximo") if maximo else None}
+    base = f"""with f as (
+          select p.codigo_cliente, p.vencimento, p.valor_previsto, p.valor_atualizado,
+                 virtua.hoje() - p.vencimento as dias, {SQL_FAIXA} as faixa
+          from virtua.v_parcelas p join virtua.v_clientes c on c.codigo = p.codigo_cliente
+          where p.situacao = 'aberta' and p.vencimento <= virtua.hoje() and {cond_cli}
+            and (%(de)s::date is null or p.vencimento >= %(de)s::date)
+            and (%(ate)s::date is null or p.vencimento <= %(ate)s::date))"""
+    resumo = db.all(base + """
+        select faixa, count(*) as parcelas, count(distinct codigo_cliente) as clientes,
+               sum(valor_previsto) as valor, sum(valor_atualizado) as valor_atualizado
+        from f group by faixa""", params)
+    ordens = {"valor": "valor_vencido desc", "atraso": "maior_atraso desc", "nome": "c.nome",
+              "antigo": "vencimento_mais_antigo"}
+    agrupado = base + """, g as (
+          select codigo_cliente, count(*) as parcelas_vencidas, sum(valor_previsto) as valor_vencido,
+                 sum(valor_atualizado) as valor_atualizado, max(dias) as maior_atraso,
+                 min(vencimento) as vencimento_mais_antigo
+          from f where %(faixa)s::text is null or faixa = %(faixa)s::text
+          group by codigo_cliente
+          having (%(min)s::numeric is null or sum(valor_previsto) >= %(min)s::numeric)
+             and (%(max)s::numeric is null or sum(valor_previsto) <= %(max)s::numeric))"""
+    total = db.one(agrupado + " select count(*) as n, coalesce(sum(valor_vencido), 0) as valor from g", params)
+    linhas = db.all(agrupado + f"""
+        select c.codigo, c.nome, c.cpf_cnpj, c.telefone, c.email, c.carteira, c.ultimo_pagamento, g.*
+        from g join virtua.v_clientes c on c.codigo = g.codigo_cliente
+        order by {ordens.get(ordem, 'valor_vencido desc')}, c.nome
+        limit %(lim)s offset %(off)s""", params | {"lim": limite, "off": offset})
+    return resumo, total, linhas
+
+
+@app.get("/api/inadimplencia")
+def inadimplencia(req: Request, q: str = "", carteira: str = "ativa", faixa: str = "", de: str = "", ate: str = "",
+                  minimo: str = "", maximo: str = "", ordem: str = "valor", pagina: int = 1):
+    exigir(req)
+    pagina = max(1, pagina)
+    resumo, total, linhas = consulta_inadimplencia(q, carteira, faixa, de, ate, minimo, maximo, ordem, 50, (pagina - 1) * 50)
+    return {"faixas": {r["faixa"]: r for r in resumo}, "total": total["n"], "valor_total": total["valor"],
+            "pagina": pagina, "por_pagina": 50, "clientes": linhas}
+
+
+@app.get("/api/previsao")
+def previsao(req: Request, dias: int = 30):
+    exigir(req)
+    dias = min(max(dias, 7), 365)
+    marcos = db.one("""
+        select coalesce(sum(valor_previsto) filter (where vencimento = virtua.hoje()), 0)          as hoje,
+               coalesce(sum(valor_previsto) filter (where vencimento = virtua.hoje() + 1), 0)      as amanha,
+               coalesce(sum(valor_previsto) filter (where vencimento <= virtua.hoje() + 7), 0)     as em_7_dias,
+               coalesce(sum(valor_previsto) filter (where vencimento <= virtua.hoje() + 30), 0)    as em_30_dias,
+               coalesce(sum(valor_previsto), 0)                                                    as futuro_total,
+               count(*)                                                                            as parcelas_futuras
+        from virtua.parcelas where situacao = 'aberta' and vencimento >= virtua.hoje()""")
+    vencido = db.one("select coalesce(sum(valor_previsto), 0) as v from virtua.parcelas "
+                     "where situacao = 'aberta' and vencimento < virtua.hoje()")["v"]
+    serie = db.all("""
+        select d::date as dia, coalesce(sum(p.valor_previsto), 0) as valor, count(p.id) as parcelas
+        from generate_series(virtua.hoje(), virtua.hoje() + %s, interval '1 day') d
+        left join virtua.parcelas p on p.vencimento = d::date and p.situacao = 'aberta'
+        group by d order by d""", (dias,))
+    parcelas = db.all("""
+        select p.id, p.vencimento, p.valor_previsto, p.nr_parcela, p.nr_acordo, p.conta, c.codigo, c.nome
+        from virtua.parcelas p join virtua.clientes c on c.codigo = p.codigo_cliente
+        where p.situacao = 'aberta' and p.vencimento between virtua.hoje() and virtua.hoje() + %s
+        order by p.vencimento, c.nome limit 300""", (dias,))
+    return {**marcos, "vencido": vencido, "dias": dias, "serie": serie, "parcelas": parcelas}
+
+
+@app.get("/api/painel")
+def painel(req: Request, de: str = "", ate: str = ""):
+    exigir(req)
+    agora = hoje()
+    d1 = data_opcional(de, "De") or date(agora.year, 1, 1)
+    d2 = data_opcional(ate, "Até") or agora
+    if d2 < d1:
+        raise HTTPException(400, "A data final é anterior à inicial")
+    p = {"de": d1, "ate": d2}
+    tot = db.one("""
+        select coalesce(sum(valor_previsto) filter (where vencimento between %(de)s and %(ate)s
+                        and status not in ('renegociada','cancelada')), 0)                         as previsto,
+               coalesce(sum(valor_pago) filter (where vencimento between %(de)s and %(ate)s), 0)   as realizado,
+               coalesce(sum(valor_pago) filter (where pago_em between %(de)s and %(ate)s), 0)      as recebido,
+               coalesce(sum(valor_previsto) filter (where vencimento between %(de)s and %(ate)s
+                        and status = 'vencida'), 0)                                                 as vencido_periodo,
+               coalesce(sum(valor_previsto) filter (where status in ('vencida','a_vencer')), 0)    as a_receber,
+               coalesce(sum(valor_previsto) filter (where status = 'vencida'), 0)                  as vencido_total,
+               coalesce(sum(valor_previsto) filter (where status = 'a_vencer'), 0)                 as a_vencer,
+               count(*) filter (where nosso_numero is not null and vencimento between %(de)s and %(ate)s)                      as boletos_emitidos,
+               count(*) filter (where nosso_numero is not null and vencimento between %(de)s and %(ate)s and status = 'paga')  as boletos_pagos,
+               count(*) filter (where nosso_numero is not null and vencimento between %(de)s and %(ate)s and status = 'vencida') as boletos_vencidos,
+               count(*) filter (where nosso_numero is not null and vencimento between %(de)s and %(ate)s and status = 'a_vencer') as boletos_em_aberto
+        from virtua.v_parcelas""", p)
+    meses = db.all("""
+        with m as (select generate_series(date_trunc('month', %(de)s::date), date_trunc('month', %(ate)s::date),
+                                          interval '1 month')::date as mes)
+        select m.mes,
+               coalesce((select sum(valor_previsto) from virtua.v_parcelas x where date_trunc('month', x.vencimento) = m.mes
+                         and x.status not in ('renegociada','cancelada')), 0) as previsto,
+               coalesce((select sum(valor_pago) from virtua.v_parcelas x where date_trunc('month', x.vencimento) = m.mes), 0) as realizado,
+               coalesce((select sum(valor_pago) from virtua.v_parcelas x where date_trunc('month', x.pago_em) = m.mes), 0) as recebido
+        from m order by m.mes""", p)
+    return {"de": d1, "ate": d2, **tot, "meses": meses}
+
+
+# ---------- relatórios (Excel / CSV) ----------
+RELATORIOS = {
+    "clientes": "Clientes",
+    "parcelas": "Cobranças",
+    "recebimentos": "Recebimentos",
+    "inadimplencia": "Inadimplência",
+}
+
+
+def dados_relatorio(tipo, q, carteira, status, faixa, de, ate, minimo, maximo):
+    if tipo == "clientes":
+        cond, params = filtro_cliente(q, carteira)
+        linhas = db.all(f"""select codigo, nome, cpf_cnpj, telefone, email, uf, carteira, total_contratado, total_recebido,
+                                   total_em_aberto, total_vencido, parcelas_vencidas, maior_atraso, ultimo_pagamento
+                            from virtua.v_clientes c where {cond} order by nome""", params)
+        cab = [("codigo", "Código"), ("nome", "Nome"), ("cpf_cnpj", "CPF/CNPJ"), ("telefone", "Telefone"), ("email", "E-mail"),
+               ("uf", "UF"), ("carteira", "Carteira"), ("total_contratado", "Contratado"), ("total_recebido", "Recebido"),
+               ("total_em_aberto", "Em aberto"), ("total_vencido", "Atrasado"), ("parcelas_vencidas", "Parcelas vencidas"),
+               ("maior_atraso", "Maior atraso (dias)"), ("ultimo_pagamento", "Último pagamento")]
+    elif tipo in ("parcelas", "recebimentos"):
+        cond, params = filtro_cliente(q, carteira)
+        campo_data = "p.pago_em" if tipo == "recebimentos" else "p.vencimento"
+        params |= {"de": data_opcional(de, "De"), "ate": data_opcional(ate, "Até"),
+                   "status": status if status in ("paga", "vencida", "a_vencer", "renegociada", "cancelada") else None}
+        extra = "and p.status = 'paga'" if tipo == "recebimentos" else "and (%(status)s::text is null or p.status = %(status)s::text)"
+        linhas = db.all(f"""
+            select c.codigo, c.nome, c.cpf_cnpj, p.conta, p.nr_acordo, p.nr_parcela, p.vencimento, p.valor_previsto,
+                   p.status, p.dias_atraso, p.valor_atualizado, p.pago_em, p.valor_pago, p.nosso_numero
+            from virtua.v_parcelas p join virtua.v_clientes c on c.codigo = p.codigo_cliente
+            where {cond} {extra}
+              and (%(de)s::date is null or {campo_data} >= %(de)s::date)
+              and (%(ate)s::date is null or {campo_data} <= %(ate)s::date)
+            order by {campo_data}, c.nome""", params)
+        cab = [("codigo", "Código"), ("nome", "Cliente"), ("cpf_cnpj", "CPF/CNPJ"), ("conta", "Contrato"), ("nr_acordo", "Acordo"),
+               ("nr_parcela", "Parcela"), ("vencimento", "Vencimento"), ("valor_previsto", "Valor"), ("status", "Situação"),
+               ("dias_atraso", "Dias de atraso"), ("valor_atualizado", "Com juros e multa"), ("pago_em", "Pago em"),
+               ("valor_pago", "Valor pago"), ("nosso_numero", "Nosso número")]
+    elif tipo == "inadimplencia":
+        _, _, linhas = consulta_inadimplencia(q, carteira, faixa, de, ate, minimo, maximo, "valor", 100000, 0)
+        cab = [("codigo", "Código"), ("nome", "Cliente"), ("cpf_cnpj", "CPF/CNPJ"), ("telefone", "Telefone"), ("email", "E-mail"),
+               ("carteira", "Carteira"), ("parcelas_vencidas", "Parcelas vencidas"), ("valor_vencido", "Valor atrasado"),
+               ("valor_atualizado", "Com juros e multa"), ("maior_atraso", "Maior atraso (dias)"),
+               ("vencimento_mais_antigo", "Vencimento mais antigo"), ("ultimo_pagamento", "Último pagamento")]
+    else:
+        raise HTTPException(404, "Relatório desconhecido")
+    return cab, linhas
+
+
+ROTULOS_SITUACAO = {"ativa_em_dia": "Ativa · em dia", "ativa_em_atraso": "Ativa · em atraso",
+                    "inadimplencia_antiga": "Inadimplência antiga", "paga": "Paga", "vencida": "Vencida",
+                    "a_vencer": "A vencer", "renegociada": "Renegociada", "cancelada": "Cancelada"}
+
+
+@app.get("/api/relatorios/{tipo}")
+def relatorio(tipo: str, req: Request, formato: str = "xlsx", q: str = "", carteira: str = "", status: str = "",
+              faixa: str = "", de: str = "", ate: str = "", minimo: str = "", maximo: str = ""):
+    exigir(req)
+    cab, linhas = dados_relatorio(tipo, q, carteira, status, faixa, de, ate, minimo, maximo)
+    nome = f"{RELATORIOS[tipo]} {hoje().isoformat()}"
+
+    def celula(chave, v):
+        if chave in ("carteira", "status"):
+            return ROTULOS_SITUACAO.get(v, v)
+        return float(v) if isinstance(v, Decimal) else v
+
+    if formato == "csv":
+        import csv
+        import io
+        buf = io.StringIO()
+        w = csv.writer(buf, delimiter=";")
+        w.writerow([t for _, t in cab])
+        def texto_csv(k, v):  # formato brasileiro, que o Excel abre direto
+            if v is None:
+                return ""
+            if isinstance(v, Decimal):
+                return f"{v:.2f}".replace(".", ",")
+            if isinstance(v, date):
+                return v.strftime("%d/%m/%Y")
+            return celula(k, v)
+        for l in linhas:
+            w.writerow([texto_csv(k, l[k]) for k, _ in cab])
+        corpo, mime, ext = ("﻿" + buf.getvalue()).encode("utf-8"), "text/csv; charset=utf-8", "csv"
+    else:
+        import io
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill
+        wb = Workbook()
+        ws = wb.active
+        ws.title = RELATORIOS[tipo][:31]
+        ws.append([t for _, t in cab])
+        for c in ws[1]:
+            c.font, c.fill = Font(bold=True, color="FFFFFF"), PatternFill("solid", fgColor="1F5FBF")
+        for l in linhas:
+            ws.append([celula(k, l[k]) for k, _ in cab])
+        for i, (k, _) in enumerate(cab, start=1):
+            letra = ws.cell(1, i).column_letter
+            if k in ("vencimento", "pago_em", "ultimo_pagamento", "vencimento_mais_antigo"):
+                fmt, larg = "DD/MM/YYYY", 12
+            elif k.startswith(("valor", "total")):
+                fmt, larg = '"R$" #,##0.00', 14
+            else:
+                fmt, larg = None, max(12, min(40, max((len(str(l[k] or "")) for l in linhas[:500]), default=10) + 2))
+            ws.column_dimensions[letra].width = larg
+            if fmt:
+                for c in ws[letra][1:]:
+                    c.number_format = fmt
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+        buf = io.BytesIO()
+        wb.save(buf)
+        corpo, mime, ext = buf.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "xlsx"
+    from urllib.parse import quote
+    return Response(corpo, media_type=mime,
+                    headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(nome)}.{ext}"})
 
 
 # ---------- site ----------
