@@ -146,6 +146,11 @@ def main():
         pv = adm.post("/api/importacao/previa", files=arqs(base_csv), headers=H).json()
         checar(pv["pode_confirmar"] and pv["parcelas_novas"] == 0 and pv["qtd_pagamentos_novos"] == 0,
                "prévia com o mesmo relatório: confere e não muda nada")
+        checar(pv["qtd_duplicadas"] == 89 and float(pv["valor_duplicadas"]) == 16374.20,
+               "prévia lista as dívidas que o Virtua exportou em dobro")
+        karen = [p for p in adm.get("/api/clientes/4985").json()["parcelas"] if p["origem"] == "virtua"]
+        checar(len(karen) == 5 and sum(float(p["valor_previsto"]) for p in karen) == 1225,
+               "dívida exportada em dobro entra uma vez só (Karen: 5 x R$ 245, como no Virtua)")
         checar(len(pv["conflitos"]) >= 2 and pv["mantidos"]["contratos"] >= 1,
                "prévia avisa as alterações feitas aqui (baixa/estorno) e conta o contrato criado aqui")
         # relatório "de amanhã": uma parcela em aberto passa a paga, e a linha de totais acompanha

@@ -613,6 +613,9 @@ function desenharPrevia(p) {
       ${p.conflitos.map(c => `<tr><td>${quando(c.em)}</td><td>${esc(c.usuario)}</td><td>${esc(c.cliente)}</td><td>${dataBR(c.vencimento)}</td><td>${esc(c.mudou.join(", "))}</td></tr>`).join("")}</tbody></table></div>
       <label style="display:block;margin-top:8px"><input type="checkbox" id="ciente"> Entendi; pode substituir</label></div>` : ""}
     ${p.qtd_clientes_novos ? `<details class="cartao" style="margin-bottom:10px"><summary>${plural(p.qtd_clientes_novos, "cliente novo", "clientes novos")}</summary><p>${p.clientes_novos.map(esc).join(" · ")}${p.qtd_clientes_novos > p.clientes_novos.length ? " …" : ""}</p></details>` : ""}
+    ${p.qtd_duplicadas ? `<details class="cartao" style="margin-bottom:10px"><summary>${plural(p.qtd_duplicadas, "linha duplicada", "linhas duplicadas")} no arquivo não entra${p.qtd_duplicadas === 1 ? "" : "m"} (${brl(p.valor_duplicadas)})</summary>
+      <p class="sub" style="margin:4px 0 8px">O Virtua exportou a mesma dívida mais de uma vez (mesmo contrato, ficha, vencimento e valor). Fica uma por dívida; se uma das cópias está paga, fica a paga.</p>
+      <div class="rolar"><table class="tabela"><thead><tr><th>Cliente</th><th>Vencimento</th><th class="num">Valor</th><th>Pago em</th><th class="num">Pago</th></tr></thead><tbody>${p.duplicadas.map(linhaPg).join("")}</tbody></table></div></details>` : ""}
     ${p.qtd_pagamentos_novos ? `<details class="cartao" style="margin-bottom:10px"><summary>${plural(p.qtd_pagamentos_novos, "pagamento novo", "pagamentos novos")} (${brl(p.valor_pagamentos_novos)})</summary>
       <div class="rolar"><table class="tabela"><thead><tr><th>Cliente</th><th>Vencimento</th><th class="num">Valor</th><th>Pago em</th><th class="num">Pago</th></tr></thead><tbody>${p.pagamentos_novos.map(linhaPg).join("")}</tbody></table></div></details>` : ""}
     <div class="barra" style="margin-top:14px">

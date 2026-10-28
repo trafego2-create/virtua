@@ -132,20 +132,43 @@ def normalizar(base: list[dict], totais: dict, extra: list[dict]) -> dict:
             "valor_pago": valor(r.get("Vlr. Realizado Parcela")), "nosso_numero": _nulo(r.get("Bol. Nosso Número")),
             "emissao_boleto": _nulo(r.get("Dta Emissão Boleto")),
             "retirar_da_cobranca": bool((r.get("Classificação") or "").strip()), "situacao": situacao, "linha_origem": n,
+            "ficha": _nulo(r.get("Nr. Ficha")),
         })
 
+    # a conferência é com todas as linhas do arquivo: a linha de totais do Virtua também soma as duplicadas
     conferencia = [
         ("Parcelas", int(re.sub(r"\D", "", totais.get("CPF / CNPJ", "")) or 0), len(parcelas)),
         ("Valor previsto", valor(totais.get("Vlr. Previsto Parcela")), sum(p["valor_previsto"] for p in parcelas)),
         ("Valor recebido", valor(totais.get("Vlr. Realizado Parcela")), sum(p["valor_pago"] for p in parcelas)),
         ("Total de acordos", valor(totais.get("Vlr. Total Acordo")), sum(valor(r.get("Vlr. Total Acordo")) for r in base)),
     ]
+    parcelas, duplicadas = _sem_duplicadas(parcelas)
     return {
         "clientes": list(clientes.values()), "contratos": list(contratos.values()),
-        "acordos": list(acordos.values()), "parcelas": parcelas,
+        "acordos": list(acordos.values()), "parcelas": parcelas, "duplicadas": duplicadas,
         "conferencia": [{"item": i, "virtua": v, "lido": l, "ok": v == l} for i, v, l in conferencia],
         "sem_email": sum(1 for c in clientes.values() if not c["email"]),
     }
+
+
+def _sem_duplicadas(parcelas: list[dict]) -> tuple[list[dict], list[dict]]:
+    """O Virtua às vezes exporta a mesma dívida em 2 linhas (mesmo contrato, ficha, vencimento e valor; "Nr Parcela" 1 e 2),
+    mas na tela dele a dívida conta uma vez só (caso Karen, cód. 4985, apontado pela Mayane em 28/10/2026).
+    Fica uma linha por dívida; se alguma cópia está paga, ficam só as pagas (o dinheiro entrou)."""
+    grupos = {}
+    for p in parcelas:
+        if p["nr_acordo"]:  # parcelas de acordo não entram nessa regra
+            grupos[id(p)] = [p]
+            continue
+        grupos.setdefault((p["conta"], p["ficha"], p["vencimento"], p["valor_previsto"]), []).append(p)
+    ficam, saem = [], []
+    for ps in grupos.values():
+        pagas = [p for p in ps if p["pago_em"]]
+        manter = pagas or ps[:1]
+        ficam += manter
+        saem += [p for p in ps if all(p is not m for m in manter)]
+    ficam.sort(key=lambda p: p["linha_origem"])
+    return ficam, saem
 
 
 def ler_arquivos(arquivos: list[tuple[str, bytes]]) -> dict:
@@ -179,7 +202,10 @@ def previa(con, dados: dict) -> dict:
     """Compara o que está no banco (origem virtua) com o que vai entrar."""
     atual = con.execute("""select codigo_cliente, conta, nr_acordo, nr_parcela, vencimento, valor_previsto, pago_em,
                                   valor_pago, situacao from virtua.parcelas where origem = 'virtua'""").fetchall()
-    antes = {_chave(p): p for p in atual}
+    antes = {}
+    for p in atual:  # cópias duplicadas de cargas antigas têm a mesma chave: vale a paga, senão vira "pagamento novo"
+        if _chave(p) not in antes or p["pago_em"]:
+            antes[_chave(p)] = p
     depois = {_chave(p): p for p in dados["parcelas"]}
     nomes = {c["codigo"]: c["nome"] for c in dados["clientes"]}
     nomes |= {r["codigo"]: r["nome"] for r in con.execute("select codigo, nome from virtua.clientes").fetchall()}
@@ -224,6 +250,8 @@ def previa(con, dados: dict) -> dict:
         "pagamentos_novos": resumo(sorted(pagamentos, key=lambda p: p["pago_em"], reverse=True)),
         "qtd_pagamentos_novos": len(pagamentos), "valor_pagamentos_novos": sum(p["valor_pago"] for p in pagamentos),
         "estornos": resumo(estornos), "qtd_estornos": len(estornos),
+        "duplicadas": resumo(dados["duplicadas"]), "qtd_duplicadas": len(dados["duplicadas"]),
+        "valor_duplicadas": sum(p["valor_previsto"] for p in dados["duplicadas"]),
         "conflitos": [{"em": c["em"], "usuario": c["usuario"], "cliente": c["nome"],
                        "vencimento": (c["depois"] or {}).get("vencimento"),
                        "mudou": sorted(k for k in (c["depois"] or {}) if k not in ("atualizado_em",)

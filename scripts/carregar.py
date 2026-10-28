@@ -30,7 +30,8 @@ def main():
             print(f"[{'OK ' if c['ok'] else 'ERRO'}] {c['item']}: Virtua {c['virtua']} | lido {c['lido']}")
         print(f"clientes {p['contagens']['clientes']} (novos {p['qtd_clientes_novos']}, saíram {p['qtd_clientes_sairam']}) · "
               f"parcelas {p['contagens']['parcelas']} (novas {p['parcelas_novas']}, removidas {p['parcelas_removidas']}) · "
-              f"pagamentos novos {p['qtd_pagamentos_novos']} (R$ {p['valor_pagamentos_novos']}) · sem e-mail {p['contagens']['sem_email']}")
+              f"pagamentos novos {p['qtd_pagamentos_novos']} (R$ {p['valor_pagamentos_novos']}) · sem e-mail {p['contagens']['sem_email']} · "
+              f"duplicadas descartadas {p['qtd_duplicadas']} (R$ {p['valor_duplicadas']})")
         if not p["pode_confirmar"]:
             sys.exit("Recusado: a conferência com os totais do Virtua não bateu.")
         if p["conflitos"] and not forcar:
